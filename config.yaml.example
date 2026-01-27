@@ -1,0 +1,30 @@
+# Databricks Claude Load Balancer 配置示例
+# 复制此文件为 config.yaml 并填入真实值
+
+load_balancer:
+  strategy: least_requests        # 负载均衡策略: least_requests, round_robin, random
+  circuit_breaker_threshold: 5    # 连续错误次数达到此值后触发熔断
+  circuit_breaker_timeout: 60     # 熔断恢复超时（秒）
+
+auth:
+  api_key: your-api-key-here      # 客户端认证密钥，Claude Code 需要使用此密钥
+
+endpoints:
+  # Databricks Workspace 端点配置
+  # 可以配置多个端点实现负载均衡
+
+  - name: workspace-1
+    api_base: https://adb-xxxxxxxxxxxx.xx.azuredatabricks.net/serving-endpoints
+    token: ${DATABRICKS_TOKEN_1}  # 支持环境变量，或直接填写 token: dapixxxxxxxx
+    weight: 1
+
+  - name: workspace-2
+    api_base: https://adb-yyyyyyyyyyyy.yy.azuredatabricks.net/serving-endpoints
+    token: ${DATABRICKS_TOKEN_2}
+    weight: 1
+
+  # 可以继续添加更多端点...
+  # - name: workspace-3
+  #   api_base: https://adb-zzzzzzzzzzzz.zz.azuredatabricks.net/serving-endpoints
+  #   token: ${DATABRICKS_TOKEN_3}
+  #   weight: 1

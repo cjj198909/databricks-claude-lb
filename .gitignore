@@ -1,0 +1,38 @@
+# 配置文件（包含敏感信息）
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.cursor/
+.cline/
+
+# Claude Code 本地配置
+.claude/
+.agents/
+
+# macOS
+.DS_Store
+
+# 日志
+*.log
+
+# 本地测试
+.env
+.env.local
+
+# video 项目（如有）
+video/
