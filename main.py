@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 DATABRICKS_MODELS = {
     "sonnet": "databricks-claude-sonnet-4-5",
-    "opus": "databricks-claude-opus-4-5",
+    "opus": "databricks-claude-opus-4-6",  # 默认使用 4-6
+    "opus-4-5": "databricks-claude-opus-4-5",
+    "opus-4-6": "databricks-claude-opus-4-6",
     "haiku": "databricks-claude-haiku-4-5",
 }
 
@@ -36,12 +38,19 @@ DEFAULT_MODEL = "databricks-claude-sonnet-4-5"
 def get_databricks_model(model: str) -> str:
     """将 Claude 模型名称映射到 Databricks 模型名称"""
     model_lower = model.lower()
-    
+
+    # 已经是 Databricks 模型名称，直接返回
     if model_lower.startswith("databricks-"):
         return model
-    
+
+    # 检查是否指定了具体版本 (如 claude-opus-4-5, opus-4-5)
     if "opus" in model_lower:
-        mapped = DATABRICKS_MODELS["opus"]
+        if "4-5" in model_lower or "4.5" in model_lower:
+            mapped = DATABRICKS_MODELS["opus-4-5"]
+        elif "4-6" in model_lower or "4.6" in model_lower:
+            mapped = DATABRICKS_MODELS["opus-4-6"]
+        else:
+            mapped = DATABRICKS_MODELS["opus"]  # 默认 4-6
     elif "sonnet" in model_lower:
         mapped = DATABRICKS_MODELS["sonnet"]
     elif "haiku" in model_lower:
@@ -49,10 +58,10 @@ def get_databricks_model(model: str) -> str:
     else:
         logger.warning(f"Unknown model '{model}', using default: {DEFAULT_MODEL}")
         mapped = DEFAULT_MODEL
-    
+
     if mapped != model:
         logger.info(f"Model mapping: {model} -> {mapped}")
-    
+
     return mapped
 
 
