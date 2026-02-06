@@ -182,6 +182,23 @@ class ClaudeProxy:
             if field in body:
                 logger.info(f"Removing unsupported field: {field}")
                 del body[field]
+
+        # Databricks 不支持 thinking.type = "adaptive"，转换为 "enabled"
+        if "thinking" in body and isinstance(body["thinking"], dict):
+            if body["thinking"].get("type") == "adaptive":
+                body["thinking"]["type"] = "enabled"
+                # Databricks 要求 thinking.type = "enabled" 时必须提供 budget_tokens
+                if "budget_tokens" not in body["thinking"]:
+                    # 使用 max_tokens 的 80% 作为默认 thinking budget，至少 1024
+                    max_tokens = body.get("max_tokens", 16000)
+                    body["thinking"]["budget_tokens"] = max(1024, int(max_tokens * 0.8))
+                    logger.info(f"Added default budget_tokens: {body['thinking']['budget_tokens']}")
+                logger.info("Converted thinking type: adaptive -> enabled")
+            elif body["thinking"].get("type") == "enabled" and "budget_tokens" not in body["thinking"]:
+                # 即使已经是 enabled 类型，也确保有 budget_tokens
+                max_tokens = body.get("max_tokens", 16000)
+                body["thinking"]["budget_tokens"] = max(1024, int(max_tokens * 0.8))
+                logger.info(f"Added missing budget_tokens: {body['thinking']['budget_tokens']}")
         
         max_retries = 3
         last_error = None
