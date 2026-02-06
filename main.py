@@ -192,10 +192,15 @@ class ClaudeProxy:
                     del body["thinking"]["budget_tokens"]
                     logger.info("Removed budget_tokens for adaptive thinking")
             elif thinking_type == "enabled" and "budget_tokens" not in body["thinking"]:
-                # enabled 类型必须提供 budget_tokens
+                # enabled 类型必须提供 budget_tokens >= 1024 且 < max_tokens
                 max_tokens = body.get("max_tokens", 16000)
-                body["thinking"]["budget_tokens"] = max(1024, int(max_tokens * 0.8))
-                logger.info(f"Added missing budget_tokens: {body['thinking']['budget_tokens']}")
+                budget = max(1024, int(max_tokens * 0.8))
+                # 确保 max_tokens > budget_tokens
+                if max_tokens <= budget:
+                    body["max_tokens"] = budget + 1
+                    logger.info(f"Increased max_tokens to {body['max_tokens']} to fit budget_tokens")
+                body["thinking"]["budget_tokens"] = budget
+                logger.info(f"Added missing budget_tokens: {budget}")
         
         max_retries = 3
         last_error = None
