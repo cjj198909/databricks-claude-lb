@@ -184,23 +184,35 @@ class ClaudeProxy:
                 del body[field]
 
         # 处理 thinking 参数兼容性
+        # Opus 4.6: 支持 adaptive（推荐），enabled + budget_tokens 已废弃
+        # 旧模型 (Sonnet 4.5, Opus 4.5 等): 仅支持 enabled + budget_tokens
         if "thinking" in body and isinstance(body["thinking"], dict):
             thinking_type = body["thinking"].get("type")
-            if thinking_type == "adaptive":
-                # Databricks 支持 adaptive 但不允许携带 budget_tokens
-                if "budget_tokens" in body["thinking"]:
+            model = body.get("model", "")
+            is_opus_4_6 = "opus-4-6" in model
+
+            if is_opus_4_6:
+                # Opus 4.6: 使用 adaptive，移除多余的 budget_tokens
+                if thinking_type == "adaptive" and "budget_tokens" in body["thinking"]:
                     del body["thinking"]["budget_tokens"]
-                    logger.info("Removed budget_tokens for adaptive thinking")
-            elif thinking_type == "enabled" and "budget_tokens" not in body["thinking"]:
-                # enabled 类型必须提供 budget_tokens >= 1024 且 < max_tokens
-                max_tokens = body.get("max_tokens", 16000)
-                budget = max(1024, int(max_tokens * 0.8))
-                # 确保 max_tokens > budget_tokens
-                if max_tokens <= budget:
-                    body["max_tokens"] = budget + 1
-                    logger.info(f"Increased max_tokens to {body['max_tokens']} to fit budget_tokens")
-                body["thinking"]["budget_tokens"] = budget
-                logger.info(f"Added missing budget_tokens: {budget}")
+                    logger.info("Removed budget_tokens for adaptive thinking (Opus 4.6)")
+            else:
+                # 旧模型: 不支持 adaptive，需转换为 enabled + budget_tokens
+                if thinking_type == "adaptive":
+                    body["thinking"]["type"] = "enabled"
+                    max_tokens = body.get("max_tokens", 16000)
+                    budget = body["thinking"].pop("budget_tokens", None) or max(1024, int(max_tokens * 0.8))
+                    if max_tokens <= budget:
+                        body["max_tokens"] = budget + 1
+                    body["thinking"]["budget_tokens"] = budget
+                    logger.info(f"Converted adaptive -> enabled with budget_tokens={budget} for {model}")
+                elif thinking_type == "enabled" and "budget_tokens" not in body["thinking"]:
+                    max_tokens = body.get("max_tokens", 16000)
+                    budget = max(1024, int(max_tokens * 0.8))
+                    if max_tokens <= budget:
+                        body["max_tokens"] = budget + 1
+                    body["thinking"]["budget_tokens"] = budget
+                    logger.info(f"Added missing budget_tokens: {budget}")
         
         max_retries = 3
         last_error = None
