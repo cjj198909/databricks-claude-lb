@@ -112,12 +112,14 @@ class LoadBalancer:
         
         return available
     
-    def select_endpoint(self) -> Optional[WorkspaceEndpoint]:
+    def select_endpoint(self, exclude: Optional[WorkspaceEndpoint] = None) -> Optional[WorkspaceEndpoint]:
         available = self.get_available_endpoints()
+        if exclude and len(available) > 1:
+            available = [ep for ep in available if ep is not exclude]
         if not available:
             logger.error("No available endpoints!")
             return None
-        
+
         if self.strategy == "least_requests":
             return min(available, key=lambda ep: ep.active_requests)
         elif self.strategy == "round_robin":
@@ -132,7 +134,10 @@ class LoadBalancer:
     async def on_request_end(self, endpoint: WorkspaceEndpoint, success: bool, is_client_error: bool = False):
         endpoint.active_requests = max(0, endpoint.active_requests - 1)
 
-        if not success and not is_client_error:
+        if success:
+            # 成功请求重置错误计数
+            endpoint.total_errors = 0
+        elif not is_client_error:
             # 只有服务端错误才计入错误数，客户端错误（4xx）不触发熔断器
             endpoint.total_errors += 1
             endpoint.last_error_time = time.time()
@@ -324,9 +329,10 @@ class ClaudeProxy:
         
         max_retries = 3
         last_error = None
-        
+        last_failed_endpoint = None
+
         for attempt in range(max_retries):
-            endpoint = self.load_balancer.select_endpoint()
+            endpoint = self.load_balancer.select_endpoint(exclude=last_failed_endpoint)
             if not endpoint:
                 raise HTTPException(status_code=503, detail={"error": {"message": "No available endpoints"}})
             
@@ -356,6 +362,7 @@ class ClaudeProxy:
 
                 if e.response.status_code in (429, 500, 502, 503, 504):
                     logger.warning(f"{endpoint.name} returned {e.response.status_code}, retrying...")
+                    last_failed_endpoint = endpoint
                     await asyncio.sleep(min(2 ** attempt, 8))
                     continue
                 else:
@@ -369,6 +376,7 @@ class ClaudeProxy:
                     
             except Exception as e:
                 last_error = e
+                last_failed_endpoint = endpoint
                 logger.error(f"{endpoint.name} failed: {e}")
                 await self.load_balancer.on_request_end(endpoint, success=False)
                 if attempt < max_retries - 1:
@@ -433,8 +441,8 @@ class ClaudeProxy:
                         if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
                             logger.warning(f"{current_endpoint.name} returned {response.status_code}, retrying stream...")
                             await asyncio.sleep(min(2 ** attempt, 8))
-                            # 选择新的 endpoint 重试
-                            new_endpoint = self.load_balancer.select_endpoint()
+                            # 选择新的 endpoint 重试，排除刚失败的
+                            new_endpoint = self.load_balancer.select_endpoint(exclude=current_endpoint)
                             if new_endpoint:
                                 current_endpoint = new_endpoint
                                 current_url = f"{current_endpoint.api_base}/anthropic/v1/messages"
@@ -445,7 +453,7 @@ class ClaudeProxy:
                                 await self.load_balancer.on_request_start(current_endpoint)
                                 logger.info(f"[{body.get('model')}] -> {current_endpoint.name} (stream attempt {attempt + 2})")
                                 continue
-                        
+
                         yield f"data: {json.dumps({'type': 'error', 'error': {'message': error_msg}})}\n\n".encode()
                         return
 
@@ -494,7 +502,8 @@ class ClaudeProxy:
                     
                     if attempt < max_retries - 1:
                         await asyncio.sleep(min(2 ** attempt, 8))
-                        new_endpoint = self.load_balancer.select_endpoint()
+                        failed_endpoint = current_endpoint
+                        new_endpoint = self.load_balancer.select_endpoint(exclude=failed_endpoint)
                         if new_endpoint:
                             current_endpoint = new_endpoint
                             current_url = f"{current_endpoint.api_base}/anthropic/v1/messages"
@@ -505,7 +514,7 @@ class ClaudeProxy:
                             await self.load_balancer.on_request_start(current_endpoint)
                             logger.info(f"[{body.get('model')}] -> {current_endpoint.name} (stream retry {attempt + 2})")
                             continue
-                    
+
                     yield f"data: {json.dumps({'type': 'error', 'error': {'message': error_detail}})}\n\n".encode()
                     return
                     
