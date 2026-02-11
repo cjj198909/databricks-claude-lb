@@ -19,7 +19,11 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 # Docker 构建和运行
 docker build -t claude-lb .
-docker run -p 8000:8000 -v $(pwd)/config.yaml:/app/config.yaml claude-lb
+docker run -p 8000:8000 \
+  -v $(pwd)/config.yaml:/app/config.yaml \
+  -v $(pwd)/data:/data \
+  claude-lb
+# 注意：Token 用量数据存储在 SQLite 中，需挂载数据目录以持久化（见配置文件中 token_tracking.db_path）
 ```
 
 ## 架构概览
@@ -59,7 +63,59 @@ docker run -p 8000:8000 -v $(pwd)/config.yaml:/app/config.yaml claude-lb
 | `/v1/messages/count_tokens` | POST | 不需要 | Token 估算 |
 | `/health` | GET | 不需要 | 健康检查 |
 | `/stats` | GET | 不需要 | 端点统计 |
+| `/usage` | GET | 不需要 | Token 用量统计 |
 | `/reset` | POST | 不需要 | 重置熔断器 |
+
+### Token 用量查询 (`/usage`)
+
+数据持久化在 SQLite (`token_usage.db`)，支持全局、按 endpoint、按模型三个维度统计。
+
+**查询参数：**
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `start` | string | 起始日期（含），格式 `YYYY-MM-DD` |
+| `end` | string | 结束日期（含），格式 `YYYY-MM-DD` |
+| `daily` | bool | 是否按天聚合，默认 `false` |
+
+**示例：**
+
+```bash
+# 全量统计
+curl http://localhost:8000/usage
+
+# 按时间范围过滤
+curl "http://localhost:8000/usage?start=2026-02-01&end=2026-02-08"
+
+# 按天聚合
+curl "http://localhost:8000/usage?daily=true"
+
+# 组合：时间范围 + 按天聚合
+curl "http://localhost:8000/usage?start=2026-02-01&end=2026-02-08&daily=true"
+```
+
+**返回格式：**
+
+```json
+{
+  "global": {
+    "total_input_tokens": 12345,
+    "total_output_tokens": 6789,
+    "total_requests": 100
+  },
+  "by_endpoint": [
+    {"endpoint": "workspace-1", "input_tokens": 5000, "output_tokens": 3000, "requests": 50}
+  ],
+  "by_model": [
+    {"model": "databricks-claude-opus-4-6", "input_tokens": 10000, "output_tokens": 5000, "requests": 80}
+  ],
+  "by_day": [
+    {"date": "2026-02-07", "input_tokens": 8000, "output_tokens": 4000, "requests": 50}
+  ]
+}
+```
+
+> `by_day` 仅在 `daily=true` 时返回。
 
 ## 配置文件
 
@@ -72,6 +128,10 @@ load_balancer:
 
 auth:
   api_key: your-key               # 客户端认证密钥
+
+token_tracking:
+  db_path: /data/token_usage.db    # Token 用量数据库路径（可选，默认 token_usage.db）
+                                   # Docker 部署时建议指向挂载目录以持久化数据
 
 endpoints:
   - name: workspace-1

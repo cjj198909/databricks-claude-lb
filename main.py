@@ -8,17 +8,19 @@ import re
 import asyncio
 import json
 import time
+import sqlite3
 import logging
 from typing import Optional
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import yaml
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
 logger = logging.getLogger(__name__)
 
 
@@ -154,12 +156,118 @@ class LoadBalancer:
         }
 
 
+# ==================== Token Tracking ====================
+
+class TokenTracker:
+    def __init__(self, db_path: str = "token_usage.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS token_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    endpoint_name TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    cache_creation_input_tokens INTEGER DEFAULT 0,
+                    cache_read_input_tokens INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_token_usage_endpoint ON token_usage(endpoint_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model)")
+
+    def record(self, endpoint_name: str, model: str, input_tokens: int, output_tokens: int,
+               cache_creation_input_tokens: int = 0, cache_read_input_tokens: int = 0):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO token_usage (timestamp, endpoint_name, model, input_tokens, output_tokens, "
+                "cache_creation_input_tokens, cache_read_input_tokens) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), endpoint_name, model,
+                 input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens),
+            )
+
+    def _build_where(self, start: Optional[str], end: Optional[str]) -> tuple[str, list]:
+        conditions = []
+        params = []
+        if start:
+            conditions.append("DATE(timestamp) >= ?")
+            params.append(start)
+        if end:
+            conditions.append("DATE(timestamp) <= ?")
+            params.append(end)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        return where, params
+
+    def _token_fields(self, row) -> dict:
+        return {
+            "input_tokens": row["input_tokens"] or 0,
+            "output_tokens": row["output_tokens"] or 0,
+            "cache_creation_input_tokens": row["cache_creation_input_tokens"] or 0,
+            "cache_read_input_tokens": row["cache_read_input_tokens"] or 0,
+        }
+
+    _SUM_COLS = (
+        "COALESCE(SUM(input_tokens), 0) as input_tokens, "
+        "COALESCE(SUM(output_tokens), 0) as output_tokens, "
+        "COALESCE(SUM(cache_creation_input_tokens), 0) as cache_creation_input_tokens, "
+        "COALESCE(SUM(cache_read_input_tokens), 0) as cache_read_input_tokens, "
+        "COUNT(*) as requests"
+    )
+
+    def get_stats(self, start: Optional[str] = None, end: Optional[str] = None, daily: bool = False) -> dict:
+        where, params = self._build_where(start, end)
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+
+            global_row = conn.execute(
+                f"SELECT {self._SUM_COLS} FROM token_usage {where}", params,
+            ).fetchone()
+
+            endpoint_rows = conn.execute(
+                f"SELECT endpoint_name, {self._SUM_COLS} FROM token_usage {where} GROUP BY endpoint_name", params,
+            ).fetchall()
+
+            model_rows = conn.execute(
+                f"SELECT model, {self._SUM_COLS} FROM token_usage {where} GROUP BY model", params,
+            ).fetchall()
+
+            result = {
+                "global": {"total_requests": global_row["requests"], **self._token_fields(global_row)},
+                "by_endpoint": [
+                    {"endpoint": r["endpoint_name"], "requests": r["requests"], **self._token_fields(r)}
+                    for r in endpoint_rows
+                ],
+                "by_model": [
+                    {"model": r["model"], "requests": r["requests"], **self._token_fields(r)}
+                    for r in model_rows
+                ],
+            }
+
+            if daily:
+                day_rows = conn.execute(
+                    f"SELECT DATE(timestamp) as date, {self._SUM_COLS} "
+                    f"FROM token_usage {where} GROUP BY DATE(timestamp) ORDER BY date", params,
+                ).fetchall()
+                result["by_day"] = [
+                    {"date": r["date"], "requests": r["requests"], **self._token_fields(r)}
+                    for r in day_rows
+                ]
+
+        return result
+
+
 # ==================== Claude Proxy (使用原生 Anthropic 端点) ====================
 
 class ClaudeProxy:
-    def __init__(self, load_balancer: LoadBalancer, api_key: str):
+    def __init__(self, load_balancer: LoadBalancer, api_key: str, token_tracker: TokenTracker):
         self.load_balancer = load_balancer
         self.api_key = api_key
+        self.token_tracker = token_tracker
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
     
     async def close(self):
@@ -274,8 +382,20 @@ class ClaudeProxy:
         response = await self.client.post(url, json=body, headers=headers)
         response.raise_for_status()
         await self.load_balancer.on_request_end(endpoint, success=True)
-        
-        return JSONResponse(content=response.json(), status_code=response.status_code)
+
+        result = response.json()
+        usage = result.get("usage", {})
+        logger.debug(f"[Non-stream] {endpoint.name} usage: {usage}")
+        self.token_tracker.record(
+            endpoint_name=endpoint.name,
+            model=body.get("model", "unknown"),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cache_creation_input_tokens=usage.get("cache_creation_input_tokens", 0),
+            cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
+        )
+
+        return JSONResponse(content=result, status_code=response.status_code)
     
     async def _stream_request(self, endpoint, url, body, headers, max_retries: int = 3) -> StreamingResponse:
         """流式请求 - 直接透传 Databricks 的 Anthropic 格式响应，支持重试"""
@@ -329,12 +449,41 @@ class ClaudeProxy:
                         yield f"data: {json.dumps({'type': 'error', 'error': {'message': error_msg}})}\n\n".encode()
                         return
 
-                    # 直接透传响应，不做任何转换
+                    # 直接透传响应，同时解析 token 使用量
+                    tracked_usage = {"input_tokens": 0, "output_tokens": 0,
+                                     "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+                    sse_buffer = ""
+
                     async for chunk in response.aiter_bytes():
                         yield chunk
+                        sse_buffer += chunk.decode("utf-8", errors="ignore")
+                        while "\n" in sse_buffer:
+                            line, sse_buffer = sse_buffer.split("\n", 1)
+                            line = line.strip()
+                            if line.startswith("data: "):
+                                try:
+                                    data = json.loads(line[6:])
+                                    if data.get("type") == "message_start":
+                                        msg_usage = data.get("message", {}).get("usage", {})
+                                        logger.debug(f"[Stream] {current_endpoint.name} message_start usage: {msg_usage}")
+                                        tracked_usage["input_tokens"] = msg_usage.get("input_tokens", 0)
+                                        tracked_usage["cache_creation_input_tokens"] = msg_usage.get("cache_creation_input_tokens", 0)
+                                        tracked_usage["cache_read_input_tokens"] = msg_usage.get("cache_read_input_tokens", 0)
+                                    elif data.get("type") == "message_delta":
+                                        delta_usage = data.get("usage", {})
+                                        logger.debug(f"[Stream] {current_endpoint.name} message_delta usage: {delta_usage}")
+                                        tracked_usage["output_tokens"] = delta_usage.get("output_tokens", 0)
+                                except (json.JSONDecodeError, AttributeError):
+                                    pass
 
                     success = True
                     await self.load_balancer.on_request_end(current_endpoint, success=True)
+                    if any(tracked_usage.values()):
+                        self.token_tracker.record(
+                            endpoint_name=current_endpoint.name,
+                            model=body.get("model", "unknown"),
+                            **tracked_usage,
+                        )
                     return
                     
                 except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as e:
@@ -414,8 +563,13 @@ def load_config(config_path: str = "config.yaml") -> ClaudeProxy:
         circuit_breaker_threshold=lb_config.get("circuit_breaker_threshold", 5),
         circuit_breaker_timeout=lb_config.get("circuit_breaker_timeout", 60),
     )
-    
-    return ClaudeProxy(load_balancer, api_key)
+
+    tracking_config = config.get("token_tracking", {})
+    db_path = tracking_config.get("db_path", "token_usage.db")
+    token_tracker = TokenTracker(db_path=db_path)
+    logger.info(f"Token tracking enabled, db: {db_path}")
+
+    return ClaudeProxy(load_balancer, api_key, token_tracker)
 
 
 # ==================== FastAPI App ====================
@@ -494,6 +648,15 @@ async def health():
 @app.get("/stats")
 async def stats():
     return proxy.get_stats()
+
+
+@app.get("/usage")
+async def usage(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    daily: bool = False,
+):
+    return proxy.token_tracker.get_stats(start=start, end=end, daily=daily)
 
 
 @app.post("/reset")
